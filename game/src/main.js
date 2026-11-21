@@ -1,215 +1,219 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed
-// 1/60 s steps (several in a slow frame, none in a fast one), and the renderer
-// paints what is there. The game moves between five screens: title, play,
-// paused, caught and win. Click-to-move steers the player toward the clicked
-// spot (Shift-click sneaks); any held movement key takes over from the click.
-//
-// ?seed=N fixes the random seed. ?shot=start|play|alert|end (with &seed=N)
-// stages that scene instead of running the loop, paints it twice and sets
-// window.__shotReady for a screenshot.
-import { BEST_KEY, STEP } from './settings.js';
-import { createSeededRandom } from './random.js';
+// Boot and the game loop: five screens, a fixed-step simulation, and the
+// wiring between input, world, sound and renderer. The loop never trusts
+// the frame rate — it always advances the world in STEP-sized slices — and
+// the world never knows about the screen, the sound or the canvas: this file
+// is the only place those meet.
+
 import { createLevel } from './level.js';
-import { GUARD_PATROLS } from './settings.js';
-import { createWorld, EVENT_ALERT, EVENT_CAUGHT, EVENT_RELIC, EVENT_SUSPICIOUS, EVENT_WIN } from './world.js';
+import { createWorld, EVENT_ALERT, EVENT_CAUGHT, EVENT_RELIC, EVENT_WIN } from './world.js';
 import { ACTION_CONFIRM, ACTION_MUTE, ACTION_PAUSE, createInput } from './input.js';
 import { createAudio } from './audio.js';
-import { createRenderer, SCREEN_CAUGHT, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
+import { createRenderer, SCREEN_LOSE, SCREEN_PAUSE, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
+import { PATROLS, STEP } from './settings.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-const FOOTSTEP_EVERY = 0.42;
-const HEARTBEAT_EVERY = 0.55;
-const HEARTBEAT_RANGE = 190;
+const BEST_KEY = 'shadow-archive-best';
 
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+function ratingFor(alerts) {
+  if (alerts === 0) return 'GHOST';
+  if (alerts === 1) return 'SHADOW';
+  return 'LOUD';
+}
 
-const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const level = createLevel();
-const world = createWorld(level, GUARD_PATROLS);
-const renderer = createRenderer(canvas, level);
-const audio = createAudio();
-void createSeededRandom(seed);
-
-function readBest() {
+function loadBest() {
   try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+    const stored = window.localStorage.getItem(BEST_KEY);
+    return stored == null ? null : Number(stored);
   } catch {
-    return 0;
+    return null;
   }
 }
 
-function saveBest(value) {
+function saveBest(seconds) {
   try {
-    window.localStorage.setItem(BEST_KEY, String(value));
+    window.localStorage.setItem(BEST_KEY, String(seconds));
   } catch {
-    // Storage can be off (private windows): the best time then lasts this visit only.
+    // A private window is fine: the best time is a nicety, not the game.
   }
 }
 
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
+export function boot() {
+  const canvas = document.getElementById('game');
+  const status = document.getElementById('status');
+  const level = createLevel();
+  const world = createWorld(level, PATROLS);
   const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-  let stepTimer = 0;
-  let heartbeatTimer = 0;
+  const audio = createAudio();
+  const renderer = createRenderer(canvas);
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes.
-  function announce(message) {
-    status.textContent = message;
+  const params = new URLSearchParams(window.location.search);
+  const shotName = params.get('shot');
+  let screen = SCREEN_TITLE;
+  let best = loadBest();
+  let rating = null;
+  let announced = '';
+  let frameTime = 0;
+  let accumulator = 0;
+  let lastNow = performance.now();
+  let shotReady = false;
+
+  if (shotName) {
+    // A deterministic screenshot scene: stage the world, then paint it.
+    const staged = stageShot(shotName, world);
+    screen = staged.screen;
+    best = staged.best || best;
+    if (screen === SCREEN_WIN) rating = ratingFor(world.state.alerts);
+  }
+
+  function announce(text) {
+    if (text === announced || !status) return;
+    announced = text;
+    status.textContent = text;
   }
 
   function startGame() {
     world.reset();
-    accumulator = 0;
-    stepTimer = 0;
-    heartbeatTimer = 0;
     screen = SCREEN_PLAY;
-    audio.unlock();
-    announce('Playing. Recover the 4 relics and reach the exit unseen.');
+    rating = null;
+    audio.resume();
+    audio.click();
+    announce(`Playing. ${world.state.lives} lives, ${level.relics.length} relics to recover.`);
   }
 
-  function endGame(won) {
-    if (won) {
-      screen = SCREEN_WIN;
-      audio.win();
-      if (best === 0 || world.state.elapsed < best) {
-        best = Math.round(world.state.elapsed);
-        saveBest(best);
-      }
-      announce(`All relics safe. Cleared in ${renderer.formatTime(world.state.elapsed)}.`);
-    } else {
-      screen = SCREEN_CAUGHT;
-      audio.caught();
-      announce(`Caught. ${world.state.lives} lives left.`);
+  function finishRun() {
+    const seconds = world.state.elapsed;
+    rating = ratingFor(world.state.alerts);
+    if (best == null || seconds < best) {
+      best = seconds;
+      saveBest(seconds);
     }
+    announce(`Archive secured in ${Math.round(seconds)} seconds, rating ${rating}.`);
   }
 
-  function handleActions() {
+  function stepOnce() {
     const actions = input.takeActions();
     if (actions & ACTION_MUTE) {
-      const muted = audio.toggleMute();
-      announce(muted ? 'Sound off.' : 'Sound on.');
+      audio.setMuted(!audio.isMuted());
     }
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_CAUGHT || screen === SCREEN_WIN)) {
-      startGame();
-    } else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
+    if (screen === SCREEN_PLAY && (actions & ACTION_PAUSE)) {
+      screen = SCREEN_PAUSE;
       announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-    // A click during play is a walk order; a key press cancels it below.
-    const pointer = input.takePointer();
-    if (pointer && screen === SCREEN_PLAY) {
-      const field = renderer.screenToField(pointer.clientX, pointer.clientY);
-      world.state.moveTarget = { x: field.x, y: field.y, sneak: pointer.sneak };
-    }
-  }
-
-  function react(events) {
-    if (events & EVENT_RELIC) audio.relic();
-    if (events & EVENT_SUSPICIOUS) audio.suspicious();
-    if (events & EVENT_ALERT) audio.alarm();
-    if (events & EVENT_WIN) endGame(true);
-    else if (events & EVENT_CAUGHT) endGame(false);
-  }
-
-  /** The steering vector for this step: keys first, else the click target. */
-  function steerVector() {
-    const keys = input.moveVector();
-    if (keys.x !== 0 || keys.y !== 0) {
-      world.state.moveTarget = null;
-      return { move: keys, sneak: input.sneaking() };
-    }
-    const target = world.state.moveTarget;
-    if (!target) return { move: { x: 0, y: 0 }, sneak: false };
-    const dx = target.x - world.state.player.x;
-    const dy = target.y - world.state.player.y;
-    if (Math.hypot(dx, dy) < 12) {
-      world.state.moveTarget = null;
-      return { move: { x: 0, y: 0 }, sneak: false };
-    }
-    return { move: { x: dx, y: dy }, sneak: target.sneak };
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      // The archive lives behind the title: guards patrol, nothing scores.
-      world.step(STEP, { x: 0, y: 0 }, false, true);
       return;
     }
-    const { move, sneak } = steerVector();
+    if (screen === SCREEN_PAUSE && (actions & ACTION_PAUSE)) {
+      screen = SCREEN_PLAY;
+      announce('Playing.');
+      return;
+    }
+    if (actions & ACTION_CONFIRM) {
+      if (screen === SCREEN_TITLE) {
+        startGame();
+        return;
+      }
+      if (screen === SCREEN_WIN || screen === SCREEN_LOSE) {
+        startGame();
+        return;
+      }
+      if (screen === SCREEN_PAUSE) {
+        screen = SCREEN_PLAY;
+        return;
+      }
+    }
+    if (screen !== SCREEN_PLAY) return;
+
+    const pointer = input.takePointer();
+    if (pointer) {
+      const field = renderer.toField(pointer.clientX, pointer.clientY);
+      world.state.moveTarget = { x: field.x, y: field.y, sneak: pointer.sneak };
+    }
+    let move = input.moveVector();
+    const sneaking = input.sneaking();
+    if (move.x !== 0 || move.y !== 0) {
+      // Keys take over from a click-to-move target the moment they move.
+      world.state.moveTarget = null;
+    } else if (world.state.moveTarget) {
+      const target = world.state.moveTarget;
+      const dx = target.x - world.state.player.x;
+      const dy = target.y - world.state.player.y;
+      const distance = Math.hypot(dx, dy);
+      if (distance < 10) {
+        world.state.moveTarget = null;
+      } else {
+        move = { x: dx / distance, y: dy / distance };
+      }
+    }
+    const sneak = sneaking || (world.state.moveTarget?.sneak ?? false);
     const events = world.step(STEP, move, sneak);
-    react(events);
-    if (world.state.player.moving) {
-      stepTimer += STEP;
-      if (stepTimer >= FOOTSTEP_EVERY) {
-        stepTimer = 0;
-        audio.footstep(world.state.player.sneaking);
+    if (events & EVENT_RELIC) {
+      audio.pickup();
+      announce(`${world.state.relicsTaken} of ${level.relics.length} relics recovered.`);
+    }
+    if (events & EVENT_ALERT) audio.alarm();
+    if (events & EVENT_CAUGHT) {
+      audio.caught();
+      if (world.state.caught) {
+        screen = SCREEN_LOSE;
+        audio.lose();
+        announce('Caught. Out of lives.');
+      } else {
+        announce(`Caught. ${world.state.lives} ${world.state.lives === 1 ? 'life' : 'lives'} left.`);
       }
     }
-    // A chasing guard close behind makes the heartbeat sound.
-    heartbeatTimer += STEP;
-    if (heartbeatTimer >= HEARTBEAT_EVERY) {
-      heartbeatTimer = 0;
-      const player = world.state.player;
-      for (const guard of world.state.guards) {
-        if (guard.state === 'alert' && Math.hypot(player.x - guard.x, player.y - guard.y) < HEARTBEAT_RANGE) {
-          audio.heartbeat();
-          break;
-        }
-      }
+    if (events & EVENT_WIN) {
+      screen = SCREEN_WIN;
+      audio.win();
+      finishRun();
     }
+    // The heartbeat follows the nearest chasing guard.
+    let chase = 0;
+    for (const guard of world.state.guards) {
+      if (guard.state !== 'alert') continue;
+      const distance = Math.hypot(guard.x - world.state.player.x, guard.y - world.state.player.y);
+      chase = Math.max(chase, Math.max(0, 1 - distance / 260));
+    }
+    audio.update(STEP, { moving: world.state.player.moving, sneaking: sneak, chase });
   }
 
   function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+    const dt = Math.min((now - lastNow) / 1000, 0.25);
+    lastNow = now;
+    frameTime += dt;
+    if (screen === SCREEN_TITLE) {
+      // The title plays over a live archive: guards patrol, nothing is lost.
+      accumulator += dt;
+      while (accumulator >= STEP) {
         accumulator -= STEP;
+        world.step(STEP, { x: 0, y: 0 }, false, true);
       }
+    } else if (screen === SCREEN_PLAY) {
+      accumulator += dt;
+      let steps = 0;
+      while (accumulator >= STEP && steps < 5) {
+        accumulator -= STEP;
+        steps += 1;
+        stepOnce();
+      }
+      if (steps === 5) accumulator = 0;
     } else {
+      // Pause, win and lose freeze the world; the frame still paints.
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(level, world, screen, { best, muted: audio.isMuted(), rating }, frameTime);
+    if (shotName && !shotReady) {
+      shotReady = true;
+      document.title = 'shot-ready';
+      document.documentElement.dataset.shotReady = '1';
+    }
+    requestAnimationFrame(frame);
   }
 
-  // Leaving the tab pauses a running game rather than letting guards close in unseen.
+  // A hidden tab never sends keyup: pause instead of letting the player
+  // walk into a guard while they are looking at another tab.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
+    if (document.hidden && screen === SCREEN_PLAY) screen = SCREEN_PAUSE;
   });
 
-  announce('Shadow Archive. Press Space or click to start.');
   requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+boot();

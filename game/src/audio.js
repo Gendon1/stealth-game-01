@@ -1,100 +1,134 @@
-// Synthesised sound only: no audio files, no network. A tiny WebAudio helper
-// that blips footsteps, chimes a relic, stings an alarm, thumps a heartbeat
-// when a chasing guard closes in, and hums the archive. Everything is guarded
-// so the game still runs where audio is unavailable.
+// Synthesised sound, no audio files: every effect is an oscillator (or two)
+// shaped by a gain envelope, straight from the WebAudio API. The context is
+// created lazily on the first user gesture, because a browser will not let
+// a page start one before that. Footsteps and the heartbeat run through
+// update(), everything else is a one-shot call from the game loop.
+
 export function createAudio() {
   let context = null;
+  let master = null;
   let muted = false;
-  let humNodes = null;
+  let stepTimer = 0;
+  let stepAlternate = false;
+  let heartTimer = 0;
 
   function ensure() {
-    if (context) return context;
-    try {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContext) return null;
-      context = new AudioContext();
-    } catch {
-      return null;
+    if (context) {
+      if (context.state === 'suspended') void context.resume();
+      return true;
     }
-    return context;
+    const AudioContextClass = window.AudioContext ?? window.webkitAudioContext;
+    if (!AudioContextClass) return false;
+    context = new AudioContextClass();
+    master = context.createGain();
+    master.gain.value = muted ? 0 : 0.5;
+    master.connect(context.destination);
+    return true;
   }
 
-  function blip(frequency, seconds, type, gainValue, when = 0) {
-    if (muted) return;
-    const ctx = ensure();
-    if (!ctx) return;
-    try {
-      const oscillator = ctx.createOscillator();
-      const gain = ctx.createGain();
-      oscillator.type = type;
-      oscillator.frequency.value = frequency;
-      gain.gain.setValueAtTime(gainValue, ctx.currentTime + when);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + when + seconds);
-      oscillator.connect(gain);
-      gain.connect(ctx.destination);
-      oscillator.start(ctx.currentTime + when);
-      oscillator.stop(ctx.currentTime + when + seconds + 0.02);
-    } catch {
-      // Sound is garnish: never let it break the game.
-    }
+  // One note: an oscillator that slides from `from` to `to` Hz over
+  // `seconds`, fading out, then stops itself. Returns nothing; silence when
+  // there is no context yet is the caller's problem, not this one's.
+  function tone(from, to, seconds, type, volume, delay = 0) {
+    if (!context || !master) return;
+    const start = context.currentTime + delay;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = type;
+    oscillator.frequency.setValueAtTime(Math.max(1, from), start);
+    if (to !== from) oscillator.frequency.exponentialRampToValueAtTime(Math.max(1, to), start + seconds);
+    gain.gain.setValueAtTime(0, start);
+    gain.gain.linearRampToValueAtTime(volume, start + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + seconds);
+    oscillator.connect(gain);
+    gain.connect(master);
+    oscillator.start(start);
+    oscillator.stop(start + seconds + 0.05);
   }
 
-  function startHum() {
-    const ctx = ensure();
-    if (!ctx || humNodes) return;
-    try {
-      const oscillator = ctx.createOscillator();
-      const gain = ctx.createGain();
-      oscillator.type = 'sine';
-      oscillator.frequency.value = 55;
-      gain.gain.value = 0.018;
-      oscillator.connect(gain);
-      gain.connect(ctx.destination);
-      oscillator.start();
-      humNodes = { oscillator, gain };
-    } catch {
-      humNodes = null;
-    }
+  function thump(volume, delay = 0) {
+    tone(95, 48, 0.12, 'sine', volume, delay);
   }
 
   return {
-    unlock() {
+    resume() {
       ensure();
-      startHum();
     },
-    toggleMute() {
-      muted = !muted;
-      if (humNodes) humNodes.gain.gain.value = muted ? 0 : 0.018;
+    setMuted(value) {
+      muted = value;
+      if (master) master.gain.value = muted ? 0 : 0.5;
+    },
+    isMuted() {
       return muted;
     },
-    get muted() {
-      return muted;
+
+    /** A soft two-note chime when a relic is recovered. */
+    pickup() {
+      if (!ensure()) return;
+      tone(660, 660, 0.16, 'sine', 0.22);
+      tone(990, 990, 0.24, 'sine', 0.2, 0.09);
     },
-    footstep(sneaking) {
-      blip(sneaking ? 140 : 190, 0.06, 'triangle', sneaking ? 0.02 : 0.045);
-    },
-    relic() {
-      blip(660, 0.14, 'sine', 0.09);
-      blip(990, 0.22, 'sine', 0.09, 0.09);
-    },
-    suspicious() {
-      blip(330, 0.18, 'square', 0.05);
-    },
+    /** The alarm: two rising sawtooth blasts. */
     alarm() {
-      blip(220, 0.28, 'sawtooth', 0.09);
-      blip(165, 0.34, 'sawtooth', 0.09, 0.22);
+      if (!ensure()) return;
+      tone(220, 440, 0.22, 'sawtooth', 0.16);
+      tone(220, 440, 0.22, 'sawtooth', 0.16, 0.24);
     },
+    /** Caught: a low thud and a falling tone. */
     caught() {
-      blip(110, 0.5, 'sawtooth', 0.1);
+      if (!ensure()) return;
+      thump(0.5);
+      tone(320, 90, 0.4, 'triangle', 0.25, 0.05);
     },
-    heartbeat() {
-      blip(70, 0.12, 'sine', 0.12);
-      blip(60, 0.14, 'sine', 0.1, 0.16);
-    },
+    /** The win: a small rising arpeggio, major and unhurried. */
     win() {
-      blip(523, 0.16, 'sine', 0.09);
-      blip(659, 0.16, 'sine', 0.09, 0.12);
-      blip(784, 0.3, 'sine', 0.09, 0.24);
+      if (!ensure()) return;
+      [523, 659, 784, 1047].forEach((freq, index) => {
+        tone(freq, freq, 0.3, 'sine', 0.2, index * 0.12);
+      });
+    },
+    /** Out of lives: three slow descending notes. */
+    lose() {
+      if (!ensure()) return;
+      [392, 330, 262].forEach((freq, index) => {
+        tone(freq, freq * 0.94, 0.34, 'triangle', 0.2, index * 0.2);
+      });
+    },
+    /** A quiet UI tick for menu presses. */
+    click() {
+      if (!ensure()) return;
+      tone(880, 880, 0.05, 'square', 0.06);
+    },
+
+    /**
+     * Per-frame sound. `fx` is { moving, sneaking, chase }: footsteps tick
+     * while the player walks (never while sneaking, which is the point of
+     * sneaking), and a heartbeat thumps faster the closer a chasing guard
+     * is, from a slow dread at the edge of hearing to a gallop up close.
+     */
+    update(dt, fx) {
+      if (!context || !master || muted) return;
+      if (fx.moving && !fx.sneaking) {
+        stepTimer -= dt;
+        if (stepTimer <= 0) {
+          stepTimer = 0.34;
+          stepAlternate = !stepAlternate;
+          tone(stepAlternate ? 82 : 74, 55, 0.08, 'sine', 0.12);
+        }
+      } else {
+        stepTimer = 0;
+      }
+      if (fx.chase > 0) {
+        heartTimer -= dt;
+        if (heartTimer <= 0) {
+          // Chase 0..1 maps to a beat every 0.9s down to every 0.38s.
+          heartTimer = 0.9 - fx.chase * 0.52;
+          thump(0.3 + fx.chase * 0.25);
+          thump(0.2 + fx.chase * 0.2, 0.16);
+        }
+      } else {
+        heartTimer = 0;
+      }
     },
   };
 }

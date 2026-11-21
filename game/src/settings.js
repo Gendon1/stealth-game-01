@@ -1,106 +1,123 @@
-// Shadow Archive: every tuning number, colour and the level map in one place.
-// The playfield is a fixed 1280x720 logical area; the renderer scales it to the
-// window, so no rule below depends on the screen size.
-export const FIELD = { width: 1280, height: 720 };
+// Shadow Archive tuning: every number the game balances on, the palette the
+// renderer paints with, the archive's floor plan and the guards' patrols.
+// One file, so a balance change never has to hunt through the game code.
+
 export const TILE = 64;
 export const COLS = 20;
 export const ROWS = 11;
+export const FIELD_WIDTH = COLS * TILE; // 1280
+export const FIELD_HEIGHT = ROWS * TILE; // 704
 
-/** The simulation's fixed step, in seconds: 60 updates a second whatever the display's rate. */
+// Fixed simulation step, in seconds: the loop always advances the world by
+// this much, so the game plays the same on a fast screen and a slow one.
 export const STEP = 1 / 60;
 
+// The player: quick on foot, slow and quiet while sneaking.
 export const PLAYER = {
-  radius: 13,
-  walkSpeed: 180,
-  sneakSpeed: 95,
-  startTile: { x: 1, y: 5 },
-};
-
-export const GUARD = {
   radius: 14,
-  patrolSpeed: 74,
-  investigateSpeed: 108,
-  chaseSpeed: 170,
-  viewRange: 270,
-  viewHalfAngle: 0.62, // ~35 degrees each side
-  turnSpeed: 2.8,
-  hearRange: 120, // footsteps carry this far when the player is not sneaking
-};
-
-export const DETECTION = {
-  fillPerSecond: 60, // at point blank, walking, in the open
-  farMultiplier: 0.55, // past 60% of view range
-  sneakMultiplier: 0.45,
-  decayPerSecond: 28,
-  suspiciousAt: 40,
-  alertedAt: 100,
-  calmAfterSeconds: 6,
+  walkSpeed: 150,
+  sneakSpeed: 85,
 };
 
 export const LIVES = 3;
 
-/**
- * The archive floor, one character per tile:
- *   # wall (blocks movement and sight)   C crate (blocks sight, waist-high cover)
- *   S shelf (blocks movement and sight)  . open floor
- *   P player start  E exit  a relic  G guard patrol start
- * Guard waypoints are listed below, not in the map.
- */
-export const LEVEL_MAP = [
-  '####################',
-  '#P....C......C...a.#',
-  '#..................#',
-  '#.##....a....##.C..#',
-  '#..................#',
-  '#.PC.....##.....C..#',
-  '#..................#',
-  '#..a...##....a.....#',
-  '#..................#',
-  '#....C......C.....E#',
-  '####################',
-];
-
-export const GUARD_PATROLS = [
-  // Each guard walks its waypoints in order (tile centres), then back again.
-  // Every leg runs along an open corridor: no wall, shelf or crate on the way.
-  { start: { x: 11, y: 1 }, waypoints: [{ x: 11, y: 1 }, { x: 11, y: 8 }, { x: 15, y: 8 }, { x: 15, y: 1 }] },
-  { start: { x: 1, y: 8 }, waypoints: [{ x: 1, y: 8 }, { x: 1, y: 2 }, { x: 5, y: 2 }, { x: 5, y: 8 }] },
-  { start: { x: 17, y: 1 }, waypoints: [{ x: 17, y: 1 }, { x: 17, y: 9 }] },
-  { start: { x: 13, y: 4 }, waypoints: [{ x: 13, y: 4 }, { x: 7, y: 4 }, { x: 7, y: 6 }, { x: 13, y: 6 }] },
-];
-
-export const RELIC_NAMES = ['Amber Seal', 'Cobalt Lens', 'Ivory Key', 'Jade Compass'];
-
-export const PALETTE = {
-  backdrop: '#0b0d12',
-  floorA: '#2c3242',
-  floorB: '#282d3b',
-  floorLine: '#3a4152',
-  wall: '#454e63',
-  wallTop: '#5a657d',
-  crate: '#7d6138',
-  crateTop: '#9a7d4c',
-  shelf: '#5f4a30',
-  shelfTop: '#7d6242',
-  shadow: '#12141b',
-  player: '#7fd4ff',
-  playerSneak: '#5aa8d8',
-  guard: '#e8b23a',
-  guardAlert: '#e5534b',
-  coneCalm: 'rgba(232, 178, 58, 0.28)',
-  coneSuspicious: 'rgba(232, 120, 58, 0.40)',
-  coneAlert: 'rgba(229, 83, 75, 0.44)',
-  relic: '#ffd75e',
-  exitLocked: '#5a6478',
-  exitOpen: '#58d68d',
-  text: '#eef1f5',
-  muted: '#9aa3b5',
-  panel: '#171b24',
-  danger: '#e5534b',
-  gold: '#f2c94c',
+// A guard's senses. viewRange is how far a cone reaches, viewHalfAngle how
+// wide it opens, hearRange how close a walking footstep gives the player
+// away. chaseSpeed is slower than the player's walk, so a spotted player who
+// keeps moving can still break away around a corner.
+export const GUARD = {
+  radius: 16,
+  viewRange: 260,
+  viewHalfAngle: 0.61,
+  hearRange: 120,
+  patrolSpeed: 55,
+  investigateSpeed: 80,
+  chaseSpeed: 135,
+  lookAroundSeconds: 2.5,
+  loseSightSeconds: 1.6,
 };
 
-export const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+// The eye meter: it fills while any guard senses the player and drains while
+// none does. Suspicion starts at 40 (a guard comes to look), the alarm at
+// 100 (a guard that saw you gives chase). Far away and sneaking both slow
+// the fill, so distance and patience are real defenses.
+export const DETECTION = {
+  fillPerSecond: 46,
+  decayPerSecond: 26,
+  farMultiplier: 0.5,
+  sneakMultiplier: 0.45,
+  suspiciousAt: 40,
+  alertedAt: 100,
+};
 
-/** Where the best (fastest) clear is kept between visits (this browser only). */
-export const BEST_KEY = 'shadow-archive.best-seconds';
+// The archive floor plan, one character per tile, 20 columns by 11 rows:
+//   # wall   S shelf   C crate   P player start   E exit   a relic   . floor
+// Walls, shelves and crates all block movement and sight; a crate is a
+// chest-high stack, so it cuts a vision cone exactly like a wall does.
+// The long open lane on row 4 is the guards' main beat, and the relics sit
+// one per wing so the player has to cross the whole archive.
+export const LEVEL_MAP = [
+  '####################',
+  '#....S..........a..#',
+  '#.......C....S.....#',
+  '#..S...........C.a.#',
+  '#..................#',
+  '#P....C......S.....#',
+  '#...S.........C....#',
+  '#..a......C........#',
+  '#.....C........a...#',
+  '#.........S......E.#',
+  '####################',
+];
+
+// Guard patrols, as tile waypoints [column, row]: each guard walks its loop
+// and turns at each waypoint. The four beats cover the west wing, the long
+// north lane, the east wing and the corridor by the exit, so no corner of
+// the archive is ever unwatched for long.
+export const PATROLS = [
+  [[2, 5], [5, 5]],
+  [[9, 4], [15, 4]],
+  [[13, 7], [17, 7]],
+  [[16, 6], [16, 9]],
+];
+
+// The palette, kept in one place so the night stays one night: cold stone
+// and lamplight, gold for the things that matter, red only for danger.
+export const PALETTE = {
+  floor: '#232833',
+  floorAlt: '#20242e',
+  floorEdge: '#2b3040',
+  wall: '#12141b',
+  wallTop: '#3a4152',
+  shelf: '#4a3421',
+  shelfEdge: '#6b4c2f',
+  crate: '#5c4a2a',
+  crateEdge: '#8a6f3e',
+  exit: '#2fd47a',
+  exitLocked: '#3d5a48',
+  exitGlow: 'rgba(47, 212, 122, 0.25)',
+  relic: '#ffd34d',
+  relicGlow: 'rgba(255, 211, 77, 0.30)',
+  player: '#e8ecf4',
+  playerSneak: '#9fb4d8',
+  guard: '#ff5a5a',
+  guardSuspicious: '#ffb02e',
+  guardAlert: '#ff2e2e',
+  cone: 'rgba(255, 214, 90, 0.20)',
+  coneEdge: 'rgba(255, 214, 90, 0.45)',
+  coneSuspicious: 'rgba(255, 176, 46, 0.26)',
+  coneAlert: 'rgba(255, 46, 46, 0.30)',
+  coneAlertEdge: 'rgba(255, 46, 46, 0.55)',
+  lastSeen: '#ffd34d',
+  moveTarget: 'rgba(232, 236, 244, 0.8)',
+  hudBack: 'rgba(10, 12, 18, 0.72)',
+  hudText: '#e8ecf4',
+  hudDim: '#9aa3b5',
+  meterBack: '#1a1e28',
+  meterFill: '#ffd34d',
+  meterDanger: '#ff2e2e',
+  panelBack: 'rgba(8, 10, 16, 0.82)',
+  panelEdge: '#3a4152',
+  title: '#ffd34d',
+  danger: '#ff5a5a',
+};
